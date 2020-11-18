@@ -13,20 +13,14 @@
 
 import type DraftEditor from 'DraftEditor.react';
 
-const DOMObserver = require('DOMObserver');
 const DraftModifier = require('DraftModifier');
-const DraftOffsetKey = require('DraftOffsetKey');
 const EditorState = require('EditorState');
 const Keys = require('Keys');
-const UserAgent = require('UserAgent');
 
-const editOnSelect = require('editOnSelect');
-const getContentEditableContainer = require('getContentEditableContainer');
-const getDraftEditorSelection = require('getDraftEditorSelection');
 const getEntityKeyForSelection = require('getEntityKeyForSelection');
-const nullthrows = require('nullthrows');
-
-const isIE = UserAgent.isBrowser('IE');
+const gkx = require('gkx');
+const isEventHandled = require('isEventHandled');
+const isSelectionAtLeafStart = require('isSelectionAtLeafStart');
 
 /**
  * Millisecond delay to allow `compositionstart` to fire again upon
@@ -48,23 +42,19 @@ const RESOLVE_DELAY = 20;
  */
 let resolved = false;
 let stillComposing = false;
-let domObserver = null;
-
-function startDOMObserver(editor: DraftEditor) {
-  if (!domObserver) {
-    domObserver = new DOMObserver(getContentEditableContainer(editor));
-    domObserver.start();
-  }
-}
+let textInputData = '';
 
 const DraftEditorCompositionHandler = {
+  onBeforeInput: function(editor: DraftEditor, e: SyntheticInputEvent<>): void {
+    textInputData = (textInputData || '') + e.data;
+  },
+
   /**
    * A `compositionstart` event has fired while we're still in composition
    * mode. Continue the current composition session to prevent a re-render.
    */
-  onCompositionStart(editor: DraftEditor): void {
+  onCompositionStart: function(editor: DraftEditor): void {
     stillComposing = true;
-    startDOMObserver(editor);
   },
 
   /**
@@ -81,37 +71,28 @@ const DraftEditorCompositionHandler = {
    * twice could break the DOM, we only use the first event. Example: Arabic
    * Google Input Tools on Windows 8.1 fires `compositionend` three times.
    */
-  onCompositionEnd(editor: DraftEditor): void {
+  onCompositionEnd: function(editor: DraftEditor, e: SyntheticEvent<>): void {
     resolved = false;
     stillComposing = false;
     setTimeout(() => {
       if (!resolved) {
-        DraftEditorCompositionHandler.resolveComposition(editor);
+        DraftEditorCompositionHandler.resolveComposition(editor, e);
       }
     }, RESOLVE_DELAY);
   },
-
-  onSelect: editOnSelect,
 
   /**
    * In Safari, keydown events may fire when committing compositions. If
    * the arrow keys are used to commit, prevent default so that the cursor
    * doesn't move, otherwise it will jump back noticeably on re-render.
    */
-  onKeyDown(editor: DraftEditor, e: SyntheticKeyboardEvent<>): void {
+  onKeyDown: function(editor: DraftEditor, e: SyntheticKeyboardEvent<>): void {
     if (!stillComposing) {
-      // This check was added in D23734060. Seemingly, we should be checking
-      // to see if the resolved flag is false here, otherwise the below
-      // comment doesn't make sense. With this change, it should prevent
-      // over-firing the resolveComposition() method, which might help fix
-      // some existing IME issues.
-      if (!resolved) {
-        // If a keydown event is received after compositionend but before the
-        // 20ms timer expires (ex: type option-E then backspace, or type A then
-        // backspace in 2-Set Korean), we should immediately resolve the
-        // composition and reinterpret the key press in edit mode.
-        DraftEditorCompositionHandler.resolveComposition(editor);
-      }
+      // If a keydown event is received after compositionend but before the
+      // 20ms timer expires (ex: type option-E then backspace, or type A then
+      // backspace in 2-Set Korean), we should immediately resolve the
+      // composition and reinterpret the key press in edit mode.
+      DraftEditorCompositionHandler.resolveComposition(editor, e);
       editor._onKeyDown(e);
       return;
     }
@@ -126,7 +107,7 @@ const DraftEditorCompositionHandler = {
    * characters that we do not want. `preventDefault` allows the composition
    * to be committed while preventing the extra characters.
    */
-  onKeyPress(_editor: DraftEditor, e: SyntheticKeyboardEvent<>): void {
+  onKeyPress: function(editor: DraftEditor, e: SyntheticKeyboardEvent<>): void {
     if (e.which === Keys.RETURN) {
       e.preventDefault();
     }
@@ -147,116 +128,77 @@ const DraftEditorCompositionHandler = {
    * Resetting innerHTML will move focus to the beginning of the editor,
    * so we update to force it back to the correct place.
    */
-  resolveComposition(editor: DraftEditor): void {
+  resolveComposition: function(
+    editor: DraftEditor,
+    event: SyntheticEvent<>,
+  ): void {
     if (stillComposing) {
       return;
     }
 
-    const lastEditorState = editor._latestEditorState;
-    const mutations = nullthrows(domObserver).stopAndFlushMutations();
-    domObserver = null;
     resolved = true;
+    const composedChars = textInputData;
+    textInputData = '';
 
-    let editorState = EditorState.set(lastEditorState, {
+    const editorState = EditorState.set(editor._latestEditorState, {
       inCompositionMode: false,
     });
 
-    editor.exitCurrentMode();
+    const currentStyle = editorState.getCurrentInlineStyle();
+    const entityKey = getEntityKeyForSelection(
+      editorState.getCurrentContent(),
+      editorState.getSelection(),
+    );
 
-    if (!mutations.size) {
-      editor.update(editorState);
-      return;
+    const mustReset =
+      !composedChars ||
+      isSelectionAtLeafStart(editorState) ||
+      currentStyle.size > 0 ||
+      entityKey !== null;
+
+    if (mustReset) {
+      editor.restoreEditorDOM();
     }
 
-    // TODO, check if Facebook still needs this flag or if it could be removed.
-    // Since there can be multiple mutations providing a `composedChars` doesn't
-    // apply well on this new model.
-    // if (
-    //   gkx('draft_handlebeforeinput_composed_text') &&
-    //   editor.props.handleBeforeInput &&
-    //   isEventHandled(
-    //     editor.props.handleBeforeInput(
-    //       composedChars,
-    //       editorState,
-    //       event.timeStamp,
-    //     ),
-    //   )
-    // ) {
-    //   return;
-    // }
+    editor.exitCurrentMode();
 
-    let contentState = editorState.getCurrentContent();
-    mutations.forEach((composedChars, offsetKey) => {
-      const {blockKey, decoratorKey, leafKey} = DraftOffsetKey.decode(
-        offsetKey,
-      );
-
-      const {start, end} = editorState
-        .getBlockTree(blockKey)
-        .getIn([decoratorKey, 'leaves', leafKey]);
-
-      const replacementRange = editorState.getSelection().merge({
-        anchorKey: blockKey,
-        focusKey: blockKey,
-        anchorOffset: start,
-        focusOffset: end,
-        isBackward: false,
-      });
-
-      const entityKey = getEntityKeyForSelection(
-        contentState,
-        replacementRange,
-      );
-      const currentStyle = contentState
-        .getBlockForKey(blockKey)
-        .getInlineStyleAt(start);
-
-      contentState = DraftModifier.replaceText(
-        contentState,
-        replacementRange,
+    if (composedChars) {
+      if (
+        gkx('draft_handlebeforeinput_composed_text') &&
+        editor.props.handleBeforeInput &&
+        isEventHandled(
+          editor.props.handleBeforeInput(
+            composedChars,
+            editorState,
+            event.timeStamp,
+          ),
+        )
+      ) {
+        return;
+      }
+      // If characters have been composed, re-rendering with the update
+      // is sufficient to reset the editor.
+      const contentState = DraftModifier.replaceText(
+        editorState.getCurrentContent(),
+        editorState.getSelection(),
         composedChars,
         currentStyle,
         entityKey,
       );
-      // We need to update the editorState so the leaf node ranges are properly
-      // updated and multiple mutations are correctly applied.
-      editorState = EditorState.set(editorState, {
-        currentContent: contentState,
-      });
-    });
+      editor.update(
+        EditorState.push(editorState, contentState, 'insert-characters'),
+      );
+      return;
+    }
 
-    // When we apply the text changes to the ContentState, the selection always
-    // goes to the end of the field, but it should just stay where it is
-    // after compositionEnd. We also apply this to the last editor state, rather
-    // than the new editor state in order to avoid problems that might come from
-    // race conditions around calculating ranges from mutations when processing
-    // the mutations above. If the ranges are off, for example, using mentions
-    // in IME mode, then the selection will move the cursor to an invalid range.
-    // See D23905960 for more context:
-    const documentSelection = getDraftEditorSelection(
-      lastEditorState,
-      getContentEditableContainer(editor),
-    );
-    const compositionEndSelectionState = documentSelection.selectionState;
-
-    editor.restoreEditorDOM();
-
-    // See:
-    // - https://github.com/facebook/draft-js/issues/2093
-    // - https://github.com/facebook/draft-js/pull/2094
-    // Apply this fix only in IE for now. We can test it in
-    // other browsers in the future to ensure no regressions
-    const editorStateWithUpdatedSelection = isIE
-      ? EditorState.forceSelection(editorState, compositionEndSelectionState)
-      : EditorState.acceptSelection(editorState, compositionEndSelectionState);
-
-    editor.update(
-      EditorState.push(
-        editorStateWithUpdatedSelection,
-        contentState,
-        'insert-characters',
-      ),
-    );
+    if (mustReset) {
+      editor.update(
+        EditorState.set(editorState, {
+          nativelyRenderedContent: null,
+          forceSelection: true,
+        }),
+      );
+    }
   },
 };
 
