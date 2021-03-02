@@ -214,6 +214,7 @@ const DraftEditorCompositionHandler = {
         end
       } = block.getIn([decoratorKey, 'leaves', leafKey]);
       const selection = editorState.getSelection();
+      console.log('updateComposedChars', offsetKey, composedChars, selection, mutations);
       const replacementRange = selection.merge({
         anchorKey: blockKey,
         focusKey: blockKey,
